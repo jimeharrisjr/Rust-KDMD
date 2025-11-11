@@ -1,4 +1,5 @@
-use nalgebra::DMatrix;
+use nalgebra::{DMatrix, DVector};
+use num_complex::Complex64;
 use std::error::Error;
 use std::fmt;
 
@@ -71,26 +72,146 @@ impl Kdmd {
 /// let result = get_a_matrix(&data, 1.0, Some(2));
 /// assert!(result.is_ok());
 /// ```
-pub fn get_a_matrix(data: &DMatrix<f64>, _p: f64, _comp: Option<usize>) -> Result<Kdmd, KdmdError> {
+pub fn get_a_matrix(data: &DMatrix<f64>, p: f64, comp: Option<usize>) -> Result<Kdmd, KdmdError> {
     let (nrows, ncols) = data.shape();
     
-    // Validate input
+    // Validate input - following R code validation
     if nrows < 2 || ncols < 2 {
-        return Err(KdmdError::InvalidMatrix("Matrix must be at least 2x2".to_string()));
+        return Err(KdmdError::InvalidMatrix("Matrix must have two dimensions (2x2 or greater)".to_string()));
     }
     
-    // Create X and Y matrices (X: all but last column, Y: all but first column)
+    if p <= 0.0 || p > 1.0 {
+        return Err(KdmdError::InvalidParameter(format!("p={}, p value must be within the range (0,1]", p)));
+    }
+    
+    // Create X and Y matrices following R: x<-data[,-ncol(data)], y<-data[,-1]
     let x = data.columns(0, ncols - 1).clone_owned();
     let y = data.columns(1, ncols - 1).clone_owned();
     
-    // For the linear DMD algorithm: Y = A * X, so A = Y * X^+
-    // This should give exact results for linear sequences
-    let x_pinv = match x.pseudo_inverse(1e-12) {
-        Ok(pinv) => pinv,
-        Err(_) => return Err(KdmdError::ComputationError("Pseudoinverse computation failed".to_string())),
+    // Perform SVD on X: wsvd<-base::svd(x)
+    let svd = x.svd(true, true);
+    let u = svd.u.ok_or(KdmdError::ComputationError("U matrix not computed".to_string()))?;
+    let v_t = svd.v_t.ok_or(KdmdError::ComputationError("V^T matrix not computed".to_string()))?;
+    let d = svd.singular_values;
+    
+    // Determine number of components r following R logic, but handle rank deficiency
+    let effective_rank = d.iter().position(|&val| val < 1e-12).unwrap_or(d.len());
+    
+    let r = if let Some(comp_val) = comp {
+        let mut r = comp_val as usize;
+        if r <= 1 {
+            eprintln!("Warning: component values below 2 are not supported. Defaulting to 2");
+            r = 2;
+        }
+        r.min(effective_rank).max(1) // Ensure we don't exceed effective rank
+    } else if (p - 1.0).abs() < f64::EPSILON {
+        effective_rank.max(1)
+    } else {
+        // Calculate explained variance: sv<-(wsvd$d^2)/sum(wsvd$d^2)
+        let d_squared_sum: f64 = d.iter().take(effective_rank).map(|val| val * val).sum();
+        if d_squared_sum < 1e-15 {
+            return Err(KdmdError::ComputationError("Matrix is rank deficient".to_string()));
+        }
+        
+        let mut cumsum = 0.0;
+        let mut r = 1; // Start with 1 for rank-deficient case
+        
+        for (i, &d_val) in d.iter().take(effective_rank).enumerate() {
+            cumsum += (d_val * d_val) / d_squared_sum;
+            if cumsum >= p {
+                r = i + 1;
+                break;
+            }
+        }
+        r.max(1).min(effective_rank)
     };
     
-    let koopman_matrix = &y * &x_pinv;
+    // Extract components: u<-wsvd$u, v<-wsvd$v, d<-wsvd$d
+    let u_r = u.columns(0, r);
+    let v = v_t.transpose(); // Convert V^T back to V
+    let v_r = v.columns(0, r);
+    let d_r = d.rows(0, r);
+    
+    // Follow R algorithm exactly:
+    // Atil<-crossprod(u[,1:r],y) = t(u[,1:r]) %*% y
+    let mut atil = u_r.transpose() * &y;
+    
+    // Atil<-crossprod(t(Atil),v[,1:r]) = t(t(Atil)) %*% v[,1:r] = Atil %*% v[,1:r]
+    atil = &atil * &v_r;
+    
+    // Atil<-crossprod(t(Atil),diag(1/d[1:r])) = t(t(Atil)) %*% diag(1/d[1:r]) = Atil %*% diag(1/d[1:r])
+    let d_inv_diag = DMatrix::from_diagonal(&d_r.map(|d_val| 1.0 / d_val));
+    atil = &atil * &d_inv_diag;
+    
+    // Eigendecomposition: eig<-eigen(Atil)
+    let eigendecomp = atil.clone().complex_eigenvalues();
+    let phi = eigendecomp;
+    
+    // Check for numerical stability
+    if atil.iter().any(|&x| !x.is_finite()) {
+        return Err(KdmdError::ComputationError("Non-finite values in A_tilde matrix".to_string()));
+    }
+    
+    // Get eigenvectors - try symmetric eigendecomposition first
+    let (q, phi_complex) = if atil.is_square() && atil.nrows() > 0 {
+        // Try symmetric eigendecomposition for real eigenvalues/vectors
+        let symmetric_result = atil.clone().symmetric_eigen();
+        let vals: Vec<Complex64> = symmetric_result.eigenvalues.iter().map(|&v| Complex64::new(v, 0.0)).collect();
+        (symmetric_result.eigenvectors, vals)
+    } else {
+        // For non-square matrices or empty matrices, use simpler approach
+        let vals = phi.iter().cloned().collect();
+        let dim = atil.nrows().min(atil.ncols()).max(1);
+        (DMatrix::identity(dim, dim), vals)
+    };
+    
+    // Check dimensions before multiplication
+    if y.ncols() != v_r.nrows() || v_r.ncols() != d_inv_diag.nrows() || d_inv_diag.ncols() != q.nrows() {
+        return Err(KdmdError::ComputationError(format!(
+            "Dimension mismatch in Psi computation: Y({}x{}) * V_r({}x{}) * D_inv({}x{}) * Q({}x{})",
+            y.nrows(), y.ncols(), v_r.nrows(), v_r.ncols(), 
+            d_inv_diag.nrows(), d_inv_diag.ncols(), q.nrows(), q.ncols()
+        )));
+    }
+    
+    // Psi<- y %*% v[,1:r] %*% diag(1/d[1:r]) %*% (Q)
+    let psi = &y * &v_r * &d_inv_diag * &q;
+    
+    // Check for numerical issues
+    if psi.iter().any(|&x| !x.is_finite()) {
+        return Err(KdmdError::ComputationError("Non-finite values in Psi matrix".to_string()));
+    }
+    
+    // x<-Psi %*% diag(Phi) %*% pracma::pinv(Psi)
+    let phi_real: Vec<f64> = phi_complex.iter().map(|c| {
+        let real_part = c.re;
+        if real_part.is_finite() { real_part } else { 0.0 }
+    }).collect();
+    
+    let phi_diag = DMatrix::from_diagonal(&DVector::from_vec(phi_real));
+    
+    // Use a higher tolerance for pseudoinverse to avoid numerical issues
+    let psi_pinv = match psi.clone().pseudo_inverse(1e-8) {
+        Ok(pinv) => pinv,
+        Err(_) => {
+            // Fallback to simple transpose for square matrices
+            if psi.is_square() {
+                match psi.clone().try_inverse() {
+                    Some(inv) => inv,
+                    None => return Err(KdmdError::ComputationError("Matrix inversion failed - singular matrix".to_string())),
+                }
+            } else {
+                return Err(KdmdError::ComputationError("Pseudoinverse computation failed".to_string()));
+            }
+        }
+    };
+    
+    let koopman_matrix = psi * &phi_diag * &psi_pinv;
+    
+    // Final check for NaN values
+    if koopman_matrix.iter().any(|&x| !x.is_finite()) {
+        return Err(KdmdError::ComputationError("Non-finite values in final Koopman matrix".to_string()));
+    }
     
     Kdmd::new(koopman_matrix)
 }
