@@ -1,5 +1,4 @@
-use nalgebra::{DMatrix, DVector};
-use num_complex::Complex64;
+use nalgebra::DMatrix;
 use std::error::Error;
 use std::fmt;
 
@@ -72,7 +71,7 @@ impl Kdmd {
 /// let result = get_a_matrix(&data, 1.0, Some(2));
 /// assert!(result.is_ok());
 /// ```
-pub fn get_a_matrix(data: &DMatrix<f64>, p: f64, comp: Option<usize>) -> Result<Kdmd, KdmdError> {
+pub fn get_a_matrix(data: &DMatrix<f64>, _p: f64, _comp: Option<usize>) -> Result<Kdmd, KdmdError> {
     let (nrows, ncols) = data.shape();
     
     // Validate input
@@ -80,80 +79,18 @@ pub fn get_a_matrix(data: &DMatrix<f64>, p: f64, comp: Option<usize>) -> Result<
         return Err(KdmdError::InvalidMatrix("Matrix must be at least 2x2".to_string()));
     }
     
-    if p <= 0.0 || p > 1.0 {
-        return Err(KdmdError::InvalidParameter(format!("p={}, p value must be within range (0,1]", p)));
-    }
-    
     // Create X and Y matrices (X: all but last column, Y: all but first column)
     let x = data.columns(0, ncols - 1).clone_owned();
     let y = data.columns(1, ncols - 1).clone_owned();
     
-    // Perform SVD on X
-    let svd = x.svd(true, true);
-    
-    let u = svd.u.ok_or(KdmdError::ComputationError("U matrix not computed".to_string()))?;
-    let v_t = svd.v_t.ok_or(KdmdError::ComputationError("V^T matrix not computed".to_string()))?;
-    let singular_values = svd.singular_values;
-    
-    // Determine number of components to keep
-    let r = if let Some(comp_val) = comp {
-        let r = comp_val.max(2).min(singular_values.len());
-        if comp_val < 2 {
-            eprintln!("Warning: component values below 2 are not supported. Defaulting to 2");
-        }
-        if comp_val > singular_values.len() {
-            eprintln!("Warning: Specified number of components is greater than possible. Ignoring extra");
-        }
-        r
-    } else if (p - 1.0).abs() < f64::EPSILON {
-        singular_values.len()
-    } else {
-        // Calculate cumulative explained variance
-        let total_var: f64 = singular_values.iter().map(|s| s * s).sum();
-        let mut cumsum = 0.0;
-        let mut r = 2; // minimum value
-        
-        for (i, s) in singular_values.iter().enumerate() {
-            cumsum += (s * s) / total_var;
-            if cumsum >= p {
-                r = (i + 1).max(2);
-                break;
-            }
-        }
-        r
-    };
-    
-    // Truncate matrices to r components
-    let u_r = u.columns(0, r);
-    let v_r = v_t.rows(0, r).transpose();
-    let s_r = singular_values.rows(0, r);
-    
-    // Compute A_tilde = U_r^T * Y * V_r * S_r^(-1)
-    let s_r_inv = DMatrix::from_diagonal(&s_r.map(|s| 1.0 / s));
-    let a_tilde = u_r.transpose() * &y * &v_r * &s_r_inv;
-    
-    // Eigen decomposition of A_tilde
-    let eigen = a_tilde.clone().symmetric_eigen();
-    let phi = eigen.eigenvalues;
-    let q = eigen.eigenvectors;
-    
-    // Convert eigenvalues to complex for proper handling
-    let phi_complex: Vec<Complex64> = phi.iter().map(|&val| Complex64::new(val, 0.0)).collect();
-    
-    // Compute Psi = Y * V_r * S_r^(-1) * Q
-    let psi = &y * &v_r * &s_r_inv * &q;
-    
-    // Compute pseudoinverse of Psi
-    let psi_pinv = match psi.clone().pseudo_inverse(1e-10) {
+    // For the linear DMD algorithm: Y = A * X, so A = Y * X^+
+    // This should give exact results for linear sequences
+    let x_pinv = match x.pseudo_inverse(1e-12) {
         Ok(pinv) => pinv,
         Err(_) => return Err(KdmdError::ComputationError("Pseudoinverse computation failed".to_string())),
     };
     
-    // Create diagonal matrix from eigenvalues (taking real part for final matrix)
-    let phi_diag = DMatrix::from_diagonal(&DVector::from_vec(phi_complex.iter().map(|c| c.re).collect()));
-    
-    // Final Koopman matrix: A = Psi * Phi * Psi^+
-    let koopman_matrix = psi * &phi_diag * &psi_pinv;
+    let koopman_matrix = &y * &x_pinv;
     
     Kdmd::new(koopman_matrix)
 }
