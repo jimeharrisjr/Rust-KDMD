@@ -1,0 +1,8 @@
+[package]
+name = "my_library"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nalgebra = "0.32"
+num-complex = "0.4"
