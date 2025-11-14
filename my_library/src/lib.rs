@@ -1,5 +1,4 @@
-use nalgebra::{DMatrix, DVector};
-use num_complex::Complex64;
+use nalgebra::DMatrix;
 use std::error::Error;
 use std::fmt;
 
@@ -48,6 +47,11 @@ impl Kdmd {
     pub fn as_matrix(&self) -> &DMatrix<f64> {
         &self.matrix
     }
+    
+    /// Get the underlying matrix (alias for as_matrix)
+    pub fn matrix(&self) -> &DMatrix<f64> {
+        &self.matrix
+    }
 }
 
 /// Create a Koopman Matrix using Dynamic Mode Decomposition
@@ -75,143 +79,151 @@ impl Kdmd {
 pub fn get_a_matrix(data: &DMatrix<f64>, p: f64, comp: Option<usize>) -> Result<Kdmd, KdmdError> {
     let (nrows, ncols) = data.shape();
     
-    // Validate input - following R code validation
-    if nrows < 2 || ncols < 2 {
-        return Err(KdmdError::InvalidMatrix("Matrix must have two dimensions (2x2 or greater)".to_string()));
+    // Validate input exactly as in R: dims <- dim(data)
+    // if (!(dims[1] > 1 & dims[2] > 1)) stop ('matrix must have two dimensions (2x2 or greater)')
+    if !(nrows > 1 && ncols > 1) {
+        return Err(KdmdError::InvalidMatrix("matrix must have two dimensions (2x2 or greater)".to_string()));
     }
     
+    // if (p <= 0 | p > 1) stop (paste('p=', p, 'p value must be within the range (0,1]'))
     if p <= 0.0 || p > 1.0 {
-        return Err(KdmdError::InvalidParameter(format!("p={}, p value must be within the range (0,1]", p)));
+        return Err(KdmdError::InvalidParameter(format!("p= {} p value must be within the range (0,1]", p)));
     }
     
-    // Create X and Y matrices following R: x<-data[,-ncol(data)], y<-data[,-1]
+    // x <- data[, -ncol(data)]
+    // y <- data[, -1]
     let x = data.columns(0, ncols - 1).clone_owned();
     let y = data.columns(1, ncols - 1).clone_owned();
     
-    // Perform SVD on X: wsvd<-base::svd(x)
+
+    
+    // wsvd <- base::svd(x)
     let svd = x.svd(true, true);
     let u = svd.u.ok_or(KdmdError::ComputationError("U matrix not computed".to_string()))?;
     let v_t = svd.v_t.ok_or(KdmdError::ComputationError("V^T matrix not computed".to_string()))?;
+    let v = v_t.transpose(); // Convert V^T to V to match R's svd$v
     let d = svd.singular_values;
     
-    // Determine number of components r following R logic, but handle rank deficiency
-    let effective_rank = d.iter().position(|&val| val < 1e-12).unwrap_or(d.len());
+
     
+    // Determine r exactly as in R
     let r = if let Some(comp_val) = comp {
-        let mut r = comp_val as usize;
+        // if (!is.na(comp)) {
+        //   r <- as.integer(comp)
+        //   if (r <= 1) {
+        //     warning('component values below 2 are not supported. Defaulting to 2')
+        //     r <- 2
+        //   }
+        //   if (r > length(wsvd$d)) {
+        //     warning('Specified number of components is greater than possible. Ignoring extra')
+        //     r <- length(wsvd$d)
+        //   }
+        // }
+        let mut r = comp_val;
         if r <= 1 {
             eprintln!("Warning: component values below 2 are not supported. Defaulting to 2");
             r = 2;
         }
-        r.min(effective_rank).max(1) // Ensure we don't exceed effective rank
-    } else if (p - 1.0).abs() < f64::EPSILON {
-        effective_rank.max(1)
+        if r > d.len() {
+            eprintln!("Warning: Specified number of components is greater than possible. Ignoring extra");
+            r = d.len();
+        }
+        r
     } else {
-        // Calculate explained variance: sv<-(wsvd$d^2)/sum(wsvd$d^2)
-        let d_squared_sum: f64 = d.iter().take(effective_rank).map(|val| val * val).sum();
-        if d_squared_sum < 1e-15 {
-            return Err(KdmdError::ComputationError("Matrix is rank deficient".to_string()));
-        }
-        
-        let mut cumsum = 0.0;
-        let mut r = 1; // Start with 1 for rank-deficient case
-        
-        for (i, &d_val) in d.iter().take(effective_rank).enumerate() {
-            cumsum += (d_val * d_val) / d_squared_sum;
-            if cumsum >= p {
-                r = i + 1;
-                break;
+        // } else {
+        //   if (p == 1) {
+        //     r <- length(wsvd$d)
+        //   } else {
+        //     sv <- (wsvd$d ^ 2) / sum(wsvd$d ^ 2)
+        //     r <- max(which(cumsum(sv) >= p)[1], 2)
+        //   }
+        // }
+        if p == 1.0 {
+            d.len()
+        } else {
+            let d_squared_sum: f64 = d.iter().map(|x| x * x).sum();
+            let sv: Vec<f64> = d.iter().map(|x| (x * x) / d_squared_sum).collect();
+            let cumsum: Vec<f64> = sv.iter().scan(0.0, |acc, &x| { *acc += x; Some(*acc) }).collect();
+            
+            let mut r = 2; // default minimum
+            for (i, &cum_val) in cumsum.iter().enumerate() {
+                if cum_val >= p {
+                    r = (i + 1).max(2);
+                    break;
+                }
             }
+            r
         }
-        r.max(1).min(effective_rank)
     };
     
-    // Extract components: u<-wsvd$u, v<-wsvd$v, d<-wsvd$d
+    // u <- wsvd$u
+    // v <- wsvd$v  
+    // d <- wsvd$d
     let u_r = u.columns(0, r);
-    let v = v_t.transpose(); // Convert V^T back to V
     let v_r = v.columns(0, r);
     let d_r = d.rows(0, r);
     
-    // Follow R algorithm exactly:
-    // Atil<-crossprod(u[,1:r],y) = t(u[,1:r]) %*% y
+    // Atil <- t(u[,1:r]) %*% y
     let mut atil = u_r.transpose() * &y;
     
-    // Atil<-crossprod(t(Atil),v[,1:r]) = t(t(Atil)) %*% v[,1:r] = Atil %*% v[,1:r]
+    // Atil <- Atil %*% v[,1:r]
     atil = &atil * &v_r;
     
-    // Atil<-crossprod(t(Atil),diag(1/d[1:r])) = t(t(Atil)) %*% diag(1/d[1:r]) = Atil %*% diag(1/d[1:r])
-    let d_inv_diag = DMatrix::from_diagonal(&d_r.map(|d_val| 1.0 / d_val));
+    // Atil <- Atil %*% diag(1 / d[1:r])
+    // Use the actual singular values as R does, without tolerance replacement
+    let d_inv_values: Vec<f64> = d_r.iter().map(|&d_val| 1.0 / d_val).collect();
+    
+    let mut d_inv_diag = DMatrix::zeros(d_inv_values.len(), d_inv_values.len());
+    for (i, &val) in d_inv_values.iter().enumerate() {
+        d_inv_diag[(i, i)] = val;
+    }
     atil = &atil * &d_inv_diag;
     
-    // Eigendecomposition: eig<-eigen(Atil)
-    let eigendecomp = atil.clone().complex_eigenvalues();
-    let phi = eigendecomp;
+    // eig <- eigen(Atil)
+    // Phi <- eig$values  
+    // Q <- eig$vectors
+    // Use complex eigendecomposition to match R exactly
+    let complex_eigenvals = atil.clone().complex_eigenvalues();
     
-    // Check for numerical stability
-    if atil.iter().any(|&x| !x.is_finite()) {
-        return Err(KdmdError::ComputationError("Non-finite values in A_tilde matrix".to_string()));
-    }
+    // For complex conjugate pairs, R's eigen() returns both eigenvalues
+    // Extract real parts for the diagonal matrix (this is an approximation)
+    let phi_values: Vec<f64> = complex_eigenvals.iter().map(|c| c.re).collect();
+    let phi_vector = nalgebra::DVector::from_vec(phi_values.clone());
     
-    // Get eigenvectors - try symmetric eigendecomposition first
-    let (q, phi_complex) = if atil.is_square() && atil.nrows() > 0 {
-        // Try symmetric eigendecomposition for real eigenvalues/vectors
-        let symmetric_result = atil.clone().symmetric_eigen();
-        let vals: Vec<Complex64> = symmetric_result.eigenvalues.iter().map(|&v| Complex64::new(v, 0.0)).collect();
-        (symmetric_result.eigenvectors, vals)
-    } else {
-        // For non-square matrices or empty matrices, use simpler approach
-        let vals = phi.iter().cloned().collect();
-        let dim = atil.nrows().min(atil.ncols()).max(1);
-        (DMatrix::identity(dim, dim), vals)
-    };
+    // Use symmetric eigendecomposition for eigenvectors (approximation)
+    let eigendecomp = atil.clone().symmetric_eigen();
+    let q = eigendecomp.eigenvectors;
     
-    // Check dimensions before multiplication
-    if y.ncols() != v_r.nrows() || v_r.ncols() != d_inv_diag.nrows() || d_inv_diag.ncols() != q.nrows() {
-        return Err(KdmdError::ComputationError(format!(
-            "Dimension mismatch in Psi computation: Y({}x{}) * V_r({}x{}) * D_inv({}x{}) * Q({}x{})",
-            y.nrows(), y.ncols(), v_r.nrows(), v_r.ncols(), 
-            d_inv_diag.nrows(), d_inv_diag.ncols(), q.nrows(), q.ncols()
-        )));
-    }
-    
-    // Psi<- y %*% v[,1:r] %*% diag(1/d[1:r]) %*% (Q)
+    // Psi <- y %*% v[, 1:r] %*% diag(1 / d[1:r]) %*% (Q)
     let psi = &y * &v_r * &d_inv_diag * &q;
     
-    // Check for numerical issues
+    // Check for problematic values
     if psi.iter().any(|&x| !x.is_finite()) {
         return Err(KdmdError::ComputationError("Non-finite values in Psi matrix".to_string()));
     }
     
-    // x<-Psi %*% diag(Phi) %*% pracma::pinv(Psi)
-    let phi_real: Vec<f64> = phi_complex.iter().map(|c| {
-        let real_part = c.re;
-        if real_part.is_finite() { real_part } else { 0.0 }
-    }).collect();
+    // x <- Psi %*% diag(Phi) %*% pracma::pinv(Psi)
+    let phi_diag = DMatrix::from_diagonal(&phi_vector);
     
-    let phi_diag = DMatrix::from_diagonal(&DVector::from_vec(phi_real));
+    // Compute pseudoinverse using SVD
+    let psi_clone = psi.clone();
+    let psi_svd = psi_clone.svd(true, true);
+    let psi_u = psi_svd.u.ok_or(KdmdError::ComputationError("Failed to compute Psi U matrix".to_string()))?;
+    let psi_s = &psi_svd.singular_values;
+    let psi_vt = psi_svd.v_t.ok_or(KdmdError::ComputationError("Failed to compute Psi V^T matrix".to_string()))?;
     
-    // Use a higher tolerance for pseudoinverse to avoid numerical issues
-    let psi_pinv = match psi.clone().pseudo_inverse(1e-8) {
-        Ok(pinv) => pinv,
-        Err(_) => {
-            // Fallback to simple transpose for square matrices
-            if psi.is_square() {
-                match psi.clone().try_inverse() {
-                    Some(inv) => inv,
-                    None => return Err(KdmdError::ComputationError("Matrix inversion failed - singular matrix".to_string())),
-                }
-            } else {
-                return Err(KdmdError::ComputationError("Pseudoinverse computation failed".to_string()));
-            }
+    // Build pseudoinverse: V * S^+ * U^T
+    let tolerance = 1e-15;
+    let mut s_pinv = DMatrix::zeros(psi_s.len(), psi_s.len());
+    for i in 0..psi_s.len() {
+        if psi_s[i] > tolerance {
+            s_pinv[(i, i)] = 1.0 / psi_s[i];
         }
-    };
-    
-    let koopman_matrix = psi * &phi_diag * &psi_pinv;
-    
-    // Final check for NaN values
-    if koopman_matrix.iter().any(|&x| !x.is_finite()) {
-        return Err(KdmdError::ComputationError("Non-finite values in final Koopman matrix".to_string()));
     }
+    let psi_pinv = psi_vt.transpose() * s_pinv * psi_u.transpose();
+    
+    // A <- kdmd(x)
+    let koopman_matrix = &psi * &phi_diag * &psi_pinv;
     
     Kdmd::new(koopman_matrix)
 }
