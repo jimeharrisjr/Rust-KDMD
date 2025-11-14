@@ -8,3 +8,4 @@ nalgebra = { version = "0.32", features = ["serde-serialize"] }
 num-complex = "0.4"
 nalgebra-lapack = "0.24"
 lapack = "0.19"
+plotters = "0.3"
